@@ -252,6 +252,7 @@
         const submitBtn = document.getElementById('submitBtn');
         const form = document.getElementById('expenseForm');
         let remainingBudget = null;
+        let selectedBudgetDetails = null;
 
         function stateFor(utilization, remaining) {
             if (remaining < 0 || utilization >= 90) return { name: 'Low / Over Budget', cls: 'danger', color: '#c0392b' };
@@ -260,17 +261,31 @@
         }
 
         function updateBudgetPanel(data) {
+            selectedBudgetDetails = data;
             remainingBudget = Number(data.remaining);
-            const utilization = Number(data.utilization);
-            const state = stateFor(utilization, remainingBudget);
 
             document.getElementById('budgetEmpty').classList.add('d-none');
             document.getElementById('budgetDetails').classList.remove('d-none');
             document.getElementById('budgetDepartment').innerText = data.department;
             document.getElementById('budgetCategory').innerText = data.category;
-            document.getElementById('allocatedValue').innerText = peso.format(data.total);
-            document.getElementById('usedValue').innerText = peso.format(data.used);
-            document.getElementById('remainingValue').innerText = peso.format(data.remaining);
+            refreshBudgetPreview();
+            validateAmount();
+        }
+
+        function refreshBudgetPreview() {
+            if (!selectedBudgetDetails) return;
+
+            const allocated = Number(selectedBudgetDetails.total || 0);
+            const committedUsed = Number(selectedBudgetDetails.used || 0);
+            const pendingAmount = Math.max(Number(amountInput.value || 0), 0);
+            const previewUsed = committedUsed + pendingAmount;
+            const previewRemaining = allocated - previewUsed;
+            const utilization = allocated > 0 ? Math.round((previewUsed / allocated) * 1000) / 10 : 0;
+            const state = stateFor(utilization, previewRemaining);
+
+            document.getElementById('allocatedValue').innerText = peso.format(allocated);
+            document.getElementById('usedValue').innerText = peso.format(previewUsed);
+            document.getElementById('remainingValue').innerText = peso.format(previewRemaining);
             document.getElementById('remainingValue').style.color = state.color;
             document.getElementById('utilizationValue').innerText = utilization + '%';
             document.getElementById('utilizationFill').style.width = Math.min(utilization, 100) + '%';
@@ -279,8 +294,6 @@
             const badge = document.getElementById('budgetState');
             badge.className = 'budget-state ' + state.cls;
             badge.innerHTML = '<i class="bi bi-circle-fill"></i> ' + state.name;
-
-            validateAmount();
         }
 
         function validateAmount() {
@@ -289,6 +302,7 @@
             amountError.style.display = invalid ? 'block' : 'none';
             submitBtn.disabled = invalid;
             amountInput.setCustomValidity(invalid ? 'Expense amount exceeds the remaining allocated budget.' : '');
+            refreshBudgetPreview();
             return !invalid;
         }
 
@@ -296,6 +310,7 @@
             requestSelect.innerHTML = '<option value="">Select related request</option>';
             requestSelect.disabled = true;
             remainingBudget = null;
+            selectedBudgetDetails = null;
             document.getElementById('budgetEmpty').classList.remove('d-none');
             document.getElementById('budgetDetails').classList.add('d-none');
 

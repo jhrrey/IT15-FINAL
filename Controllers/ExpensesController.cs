@@ -371,34 +371,53 @@ namespace FinSight.Controllers
             DateTime? endDate,
             string? search)
         {
-            const string sql = @"
+            var columns = await LoadTableColumnInfoAsync("Expenses");
+            var budgetRequestExpression = columns.ContainsKey("BudgetRequestID")
+                ? "e.BudgetRequestID"
+                : "CAST(NULL AS INT)";
+            var descriptionExpression = columns.ContainsKey("Description")
+                ? "e.[Description]"
+                : "CAST('' AS NVARCHAR(1000))";
+            var titleExpression = columns.ContainsKey("ExpenseTitle")
+                ? $"COALESCE(NULLIF(e.ExpenseTitle, ''), NULLIF({descriptionExpression}, ''), 'Expense')"
+                : $"COALESCE(NULLIF({descriptionExpression}, ''), 'Expense')";
+            var categoryExpression = columns.ContainsKey("Category")
+                ? "COALESCE(NULLIF(e.Category, ''), NULLIF(b.Category, ''), 'General')"
+                : "COALESCE(NULLIF(b.Category, ''), 'General')";
+            var dateExpression = GetExpenseDateSqlExpression(columns);
+            var statusExpression = columns.ContainsKey("Status")
+                ? "COALESCE(NULLIF(e.[Status], ''), 'Recorded')"
+                : "'Recorded'";
+
+            var sql = $@"
                 SELECT
                     e.ExpenseID,
-                    e.BudgetRequestID,
+                    {budgetRequestExpression} AS BudgetRequestID,
                     e.BudgetID,
                     e.DepartmentID,
                     e.TenantID,
-                    e.ExpenseTitle,
-                    e.Category,
-                    e.[Description],
+                    {titleExpression} AS ExpenseTitle,
+                    {categoryExpression} AS Category,
+                    {descriptionExpression} AS [Description],
                     e.Amount,
-                    e.ExpenseDate,
-                    e.[Status],
+                    {dateExpression} AS ExpenseDate,
+                    {statusExpression} AS [Status],
                     d.DepartmentName
                 FROM Expenses e
                 LEFT JOIN Departments d ON d.DepartmentID = e.DepartmentID
+                LEFT JOIN Budgets b ON b.BudgetID = e.BudgetID
                 WHERE (@TenantID IS NULL OR e.TenantID = @TenantID)
                   AND (@DepartmentID IS NULL OR e.DepartmentID = @DepartmentID)
-                  AND (@Status IS NULL OR e.[Status] = @Status)
-                  AND (@StartDate IS NULL OR e.ExpenseDate >= @StartDate)
-                  AND (@EndDate IS NULL OR e.ExpenseDate < @EndDate)
+                  AND (@Status IS NULL OR {statusExpression} = @Status)
+                  AND (@StartDate IS NULL OR {dateExpression} >= @StartDate)
+                  AND (@EndDate IS NULL OR {dateExpression} < @EndDate)
                   AND (
                         @Search IS NULL
-                        OR e.ExpenseTitle LIKE @Search
-                        OR e.Category LIKE @Search
-                        OR e.[Description] LIKE @Search
+                        OR {titleExpression} LIKE @Search
+                        OR {categoryExpression} LIKE @Search
+                        OR {descriptionExpression} LIKE @Search
                   )
-                ORDER BY e.ExpenseDate DESC, e.ExpenseID DESC";
+                ORDER BY {dateExpression} DESC, e.ExpenseID DESC";
 
             var searchTerm = string.IsNullOrWhiteSpace(search) ? null : $"%{search.Trim()}%";
 
@@ -499,6 +518,69 @@ namespace FinSight.Controllers
                 DepartmentName = GetString(reader, "DepartmentName", "General"),
                 TenantID = GetInt32(reader, "TenantID")
             });
+        }
+
+        private async Task<Dictionary<string, TableColumnInfo>> LoadTableColumnInfoAsync(string tableName)
+        {
+            const string sql = @"
+                SELECT
+                    c.name AS ColumnName,
+                    CASE
+                        WHEN t.name IN ('nvarchar', 'nchar') AND c.max_length > 0 THEN c.max_length / 2
+                        ELSE c.max_length
+                    END AS MaxLength
+                FROM sys.columns c
+                INNER JOIN sys.types t ON t.user_type_id = c.user_type_id
+                WHERE c.object_id = OBJECT_ID(@TableName)";
+
+            var rows = await ExpenseQueryAsync(sql, command =>
+            {
+                AddParameter(command, "@TableName", tableName);
+            }, reader => new TableColumnInfo
+            {
+                Name = GetString(reader, "ColumnName", string.Empty),
+                MaxLength = GetInt32(reader, "MaxLength")
+            });
+
+            var result = new Dictionary<string, TableColumnInfo>(StringComparer.OrdinalIgnoreCase);
+            foreach (var row in rows.Where(r => !string.IsNullOrWhiteSpace(r.Name)))
+            {
+                result[row.Name] = row;
+            }
+
+            return result;
+        }
+
+        private static string GetExpenseDateSqlExpression(IReadOnlyDictionary<string, TableColumnInfo> columns)
+        {
+            if (columns.ContainsKey("ExpenseDate"))
+                return "e.ExpenseDate";
+
+            if (columns.ContainsKey("Date"))
+                return "e.[Date]";
+
+            if (columns.ContainsKey("CreatedAt"))
+                return "e.CreatedAt";
+
+            return "GETDATE()";
+        }
+
+        private static string EscapeSqlIdentifier(string identifier)
+        {
+            return $"[{identifier.Replace("]", "]]")}]";
+        }
+
+        private static string TrimForColumn(
+            string? value,
+            IReadOnlyDictionary<string, TableColumnInfo> columns,
+            string columnName,
+            string fallback)
+        {
+            var text = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+            if (columns.TryGetValue(columnName, out var column) && column.MaxLength > 0 && text.Length > column.MaxLength)
+                return text[..column.MaxLength];
+
+            return text;
         }
 
         private async Task<List<T>> ExpenseQueryAsync<T>(string sql, Action<DbCommand> configure, Func<DbDataReader, T> map)
@@ -1389,55 +1471,65 @@ namespace FinSight.Controllers
 
         private async Task InsertExpenseCompatibilityAsync(Expense model)
         {
-            const string sql = @"
-                INSERT INTO Expenses
-                (
-                    BudgetRequestID,
-                    BudgetID,
-                    DepartmentID,
-                    TenantID,
-                    ExpenseTitle,
-                    Category,
-                    [Description],
-                    Amount,
-                    ExpenseDate,
-                    [Status],
-                    CreatedBy,
-                    [Year],
-                    CreatedAt
-                )
-                VALUES
-                (
-                    @BudgetRequestID,
-                    @BudgetID,
-                    @DepartmentID,
-                    @TenantID,
-                    @ExpenseTitle,
-                    @Category,
-                    @Description,
-                    @Amount,
-                    @ExpenseDate,
-                    @Status,
-                    @CreatedBy,
-                    @Year,
-                    @CreatedAt
-                )";
+            var columns = await LoadTableColumnInfoAsync("Expenses");
+            if (!columns.ContainsKey("BudgetID") || !columns.ContainsKey("DepartmentID") ||
+                !columns.ContainsKey("TenantID") || !columns.ContainsKey("Amount"))
+            {
+                throw new InvalidOperationException("The hosted Expenses table is missing required budget, tenant, or amount columns.");
+            }
+
+            var insertColumns = new List<string>();
+            var insertValues = new List<string>();
+            var parameters = new List<(string Name, object? Value)>();
+            var expenseDate = model.ExpenseDate == default ? DateTime.Now : model.ExpenseDate;
+            var createdAt = model.CreatedAt == default ? DateTime.Now : model.CreatedAt;
+
+            void AddIfExists(string columnName, string parameterName, object? value)
+            {
+                if (!columns.ContainsKey(columnName))
+                    return;
+
+                insertColumns.Add(EscapeSqlIdentifier(columnName));
+                insertValues.Add(parameterName);
+                parameters.Add((parameterName, value));
+            }
+
+            AddIfExists("BudgetRequestID", "@BudgetRequestID", model.BudgetRequestID);
+            AddIfExists("BudgetID", "@BudgetID", model.BudgetID);
+            AddIfExists("DepartmentID", "@DepartmentID", model.DepartmentID);
+            AddIfExists("TenantID", "@TenantID", model.TenantID);
+            AddIfExists("ExpenseTitle", "@ExpenseTitle", TrimForColumn(model.ExpenseTitle, columns, "ExpenseTitle", "Expense"));
+            AddIfExists("Category", "@Category", TrimForColumn(model.Category, columns, "Category", "General"));
+            AddIfExists(
+                "Description",
+                "@Description",
+                TrimForColumn(
+                    model.Description,
+                    columns,
+                    "Description",
+                    string.IsNullOrWhiteSpace(model.ExpenseTitle) ? "Expense" : model.ExpenseTitle));
+            AddIfExists("Amount", "@Amount", model.Amount);
+
+            if (columns.ContainsKey("ExpenseDate"))
+                AddIfExists("ExpenseDate", "@ExpenseDate", expenseDate);
+            else
+                AddIfExists("Date", "@ExpenseDate", expenseDate);
+
+            AddIfExists("Status", "@Status", TrimForColumn(model.Status, columns, "Status", "Recorded"));
+            AddIfExists("CreatedBy", "@CreatedBy", model.CreatedBy);
+            AddIfExists("Year", "@Year", model.Year == 0 ? expenseDate.Year : model.Year);
+            AddIfExists("CreatedAt", "@CreatedAt", createdAt);
+
+            var sql = $@"
+                INSERT INTO Expenses ({string.Join(", ", insertColumns)})
+                VALUES ({string.Join(", ", insertValues)})";
 
             await ExpenseExecuteAsync(sql, command =>
             {
-                AddParameter(command, "@BudgetRequestID", model.BudgetRequestID);
-                AddParameter(command, "@BudgetID", model.BudgetID);
-                AddParameter(command, "@DepartmentID", model.DepartmentID);
-                AddParameter(command, "@TenantID", model.TenantID);
-                AddParameter(command, "@ExpenseTitle", model.ExpenseTitle?.Trim());
-                AddParameter(command, "@Category", model.Category?.Trim());
-                AddParameter(command, "@Description", model.Description?.Trim());
-                AddParameter(command, "@Amount", model.Amount);
-                AddParameter(command, "@ExpenseDate", model.ExpenseDate == default ? DateTime.Now : model.ExpenseDate);
-                AddParameter(command, "@Status", model.Status);
-                AddParameter(command, "@CreatedBy", model.CreatedBy);
-                AddParameter(command, "@Year", model.Year);
-                AddParameter(command, "@CreatedAt", model.CreatedAt == default ? DateTime.Now : model.CreatedAt);
+                foreach (var parameter in parameters)
+                {
+                    AddParameter(command, parameter.Name, parameter.Value);
+                }
             });
         }
 
@@ -1592,6 +1684,12 @@ namespace FinSight.Controllers
             public int BudgetID { get; set; }
             public string DepartmentName { get; set; } = string.Empty;
             public string Category { get; set; } = string.Empty;
+        }
+
+        private sealed class TableColumnInfo
+        {
+            public string Name { get; set; } = string.Empty;
+            public int MaxLength { get; set; }
         }
 
     }
